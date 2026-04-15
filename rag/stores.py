@@ -267,6 +267,56 @@ class BM25Store:
             ))
         return hits
 
+    def search_fallback(
+        self,
+        query: str,
+        k: int = TOP_K_SEARCH,
+        doc_id: Optional[str] = None,
+    ) -> List[SearchHit]:
+        """
+        Individual-term fallback used when the full query returns 0 hits.
+        Scores each non-stopword term separately and merges by best score.
+        Catches cases where the document phrases things differently
+        (e.g. query says "fabric admin", doc says "Fabric administrator").
+        """
+        if self._index is None:
+            return []
+        _STOP = {
+            "a", "an", "the", "is", "are", "was", "were", "be", "been",
+            "have", "has", "had", "do", "does", "did", "will", "would",
+            "can", "could", "should", "may", "might", "to", "of", "in",
+            "for", "on", "with", "at", "by", "from", "as", "and", "or",
+            "but", "not", "this", "that", "it", "its", "i", "you", "we",
+        }
+        terms = [t for t in query.lower().split() if t not in _STOP and len(t) > 2]
+        if not terms:
+            return []
+
+        best_score: Dict[int, float] = {}
+        for term in terms:
+            scores = self._index.get_scores([term])
+            for idx, score in enumerate(scores):
+                if score > 0:
+                    best_score[idx] = max(best_score.get(idx, 0.0), float(score))
+
+        if not best_score:
+            return []
+
+        hits: List[SearchHit] = []
+        for idx in sorted(best_score, key=lambda i: best_score[i], reverse=True):
+            if len(hits) >= k:
+                break
+            if doc_id and self._doc_map[idx] != doc_id:
+                continue
+            hits.append(SearchHit(
+                child_id=self._id_map[idx],
+                parent_id=self._parent_map[idx],
+                text=self._text_map[idx],
+                score=best_score[idx],
+                source="bm25_fallback",
+            ))
+        return hits
+
 
 # ── ColBERT store ─────────────────────────────────────────────────────────────
 
@@ -427,22 +477,29 @@ class RAGStores:
         self.parents.add(parents)
         self._all_children.extend(children)
 
-        # Qdrant (dense, supports per-doc filter natively)
+        # Qdrant + BM25 are fast — ready for queries immediately
         await self.qdrant.add_children(children, dim)
-
-        # BM25 – rebuild from all children so per-doc filter works
         self.bm25.rebuild(self._all_children)
 
-        # ColBERT – rebuild from all children
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.colbert.build_index, self._all_children)
-
         self._ready = True
-        logger.info("All indexes ready (doc: %s)", doc_id)
+        logger.info("Core indexes ready (doc: %s) — ColBERT building in background", doc_id)
+
+        # ColBERT is slow to build; fire as background task so ingest returns now.
+        # Queries use the cross-encoder fallback until ColBERT is done.
+        asyncio.create_task(self._build_colbert_bg(doc_id))
 
         # Persist in-memory state whenever Qdrant is also persistent
         if QDRANT_URL:
             self.save_local()
+
+    async def _build_colbert_bg(self, doc_id: str):
+        """Build ColBERT index without blocking ingestion or queries."""
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.colbert.build_index, self._all_children)
+            logger.info("ColBERT index ready (doc: %s)", doc_id)
+        except Exception as e:
+            logger.warning("ColBERT background build failed: %s — cross-encoder stays active", e)
 
     def is_ready(self) -> bool:
         return self._ready

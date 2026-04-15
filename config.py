@@ -35,19 +35,22 @@ QDRANT_CACHE_COLLECTION: str   = os.getenv("QDRANT_CACHE_COLLECTION", "rag_cache
 QDRANT_RAPTOR_COLLECTION: str  = os.getenv("QDRANT_RAPTOR_COLLECTION", "rag_raptor")
 
 # ── Chunking ──────────────────────────────────────────────
-PARENT_CHUNK_TOKENS: int  = int(os.getenv("PARENT_CHUNK_TOKENS", "1024"))
-CHILD_CHUNK_TOKENS: int   = int(os.getenv("CHILD_CHUNK_TOKENS", "256"))
+PARENT_CHUNK_TOKENS: int  = int(os.getenv("PARENT_CHUNK_TOKENS", "800"))
+CHILD_CHUNK_TOKENS: int   = int(os.getenv("CHILD_CHUNK_TOKENS", "200"))
 CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "32"))
 
 # ── Retrieval ─────────────────────────────────────────────
-TOP_K_SEARCH: int  = int(os.getenv("TOP_K_SEARCH", "15"))
-TOP_K_RERANK: int  = int(os.getenv("TOP_K_RERANK", "5"))
+TOP_K_SEARCH: int  = int(os.getenv("TOP_K_SEARCH", "25"))
+TOP_K_RERANK: int  = int(os.getenv("TOP_K_RERANK", "8"))
 TOP_K_PARENTS: int = int(os.getenv("TOP_K_PARENTS", "4"))
 RRF_K: int         = int(os.getenv("RRF_K", "60"))
 
 # ── Multi-query expansion ─────────────────────────────────
-MULTI_QUERY_ENABLED: bool = os.getenv("MULTI_QUERY_ENABLED", "true").lower() == "true"
-MULTI_QUERY_COUNT: int    = int(os.getenv("MULTI_QUERY_COUNT", "3"))
+MULTI_QUERY_ENABLED: bool  = os.getenv("MULTI_QUERY_ENABLED", "true").lower() == "true"
+MULTI_QUERY_COUNT: int     = int(os.getenv("MULTI_QUERY_COUNT", "3"))
+# Only expand when first pass returns fewer than this many combined dense+bm25 hits.
+# Set to a large number (e.g. 999) to always expand; 0 to never expand.
+MULTI_QUERY_MIN_HITS: int  = int(os.getenv("MULTI_QUERY_MIN_HITS", "8"))
 
 # ── MMR ───────────────────────────────────────────────────
 MMR_ENABLED: bool  = os.getenv("MMR_ENABLED", "true").lower() == "true"

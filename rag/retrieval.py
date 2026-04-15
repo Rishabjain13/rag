@@ -32,7 +32,7 @@ import numpy as np
 
 from config import (
     TOP_K_SEARCH, TOP_K_RERANK, TOP_K_PARENTS, RRF_K,
-    MULTI_QUERY_ENABLED, MULTI_QUERY_COUNT,
+    MULTI_QUERY_ENABLED, MULTI_QUERY_COUNT, MULTI_QUERY_MIN_HITS,
     MMR_ENABLED, MMR_LAMBDA,
     COMPRESSION_ENABLED,
     FAST_MODEL_API_KEY, FAST_MODEL_BASE_URL, OPENROUTER_FAST_MODEL,
@@ -398,11 +398,7 @@ async def retrieve(
         trace.parents_returned = len(contexts)
         return route, contexts, None, trace
 
-    # ── Query expansion ───────────────────────────────────────────────────────
-    queries = await expand_query(query)
-    trace.queries = queries
-
-    # ── HyDE ─────────────────────────────────────────────────────────────────
+    # ── Embed query (HyDE uses a hypothetical answer as the query vector) ────────
     if route == QueryRoute.HYDE and hyde_fn is not None:
         hyp = await hyde_fn(query)
         q_vec = await embed_query(hyp)
@@ -410,24 +406,44 @@ async def retrieve(
     else:
         q_vec = await embed_query(query)
 
-    # ── Multi-query hybrid search ─────────────────────────────────────────────
-    all_ranked: List[List[SearchHit]] = []
-    total_dense = total_colbert = total_bm25 = 0
+    # ── First-pass search (original query, full k) ────────────────────────────
+    first_hits, nd, nc, nb = await hybrid_search(query, q_vec, stores, TOP_K_SEARCH, doc_id)
+    all_ranked: List[List[SearchHit]] = [first_hits]
+    total_dense, total_colbert, total_bm25 = nd, nc, nb
+    trace.queries = [query]
 
-    search_tasks = [
-        hybrid_search(q, await embed_query(q) if q != query else q_vec,
-                      stores, TOP_K_SEARCH, doc_id)
-        for q in queries
-    ]
-    results = await asyncio.gather(*search_tasks)
-
-    for hits, nd, nc, nb in results:
-        all_ranked.append(hits)
-        total_dense   += nd
-        total_colbert += nc
-        total_bm25    += nb
+    # ── Conditional multi-query expansion ─────────────────────────────────────
+    # Only call the LLM for expansion when the first pass is sparse.
+    # Good first-pass results (dense+bm25 >= MULTI_QUERY_MIN_HITS) don't need it.
+    first_pass_hits = nd + nb
+    if MULTI_QUERY_ENABLED and first_pass_hits < MULTI_QUERY_MIN_HITS:
+        logger.info("First pass sparse (%d hits) — expanding query", first_pass_hits)
+        variants = [q for q in await expand_query(query) if q.lower() != query.lower()]
+        if variants:
+            trace.queries = [query] + variants
+            extra_tasks = [
+                hybrid_search(q, await embed_query(q), stores, TOP_K_SEARCH, doc_id)
+                for q in variants
+            ]
+            for hits, nd2, nc2, nb2 in await asyncio.gather(*extra_tasks):
+                all_ranked.append(hits)
+                total_dense   += nd2
+                total_colbert += nc2
+                total_bm25    += nb2
 
     fused = rrf_fusion(all_ranked)[:TOP_K_SEARCH]
+
+    # ── Zero-hit fallback: individual BM25 term search ────────────────────────
+    # Fires when ALL three indexes return nothing — typically caused by vocabulary
+    # mismatch (query uses different phrasing than the document).
+    if not fused:
+        logger.info("Zero fused hits — trying BM25 term fallback")
+        fallback = stores.bm25.search_fallback(query, TOP_K_SEARCH, doc_id)
+        if fallback:
+            fused = fallback
+            total_bm25 += len(fallback)
+            logger.info("BM25 term fallback: %d hits", len(fallback))
+
     trace.dense_hits   = total_dense
     trace.colbert_hits = total_colbert
     trace.bm25_hits    = total_bm25

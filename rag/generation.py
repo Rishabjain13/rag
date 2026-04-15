@@ -80,12 +80,16 @@ _HYDE_SYSTEM = (
 )
 
 _RAG_SYSTEM_TMPL = (
-    "You are a precise, helpful assistant that answers questions from document excerpts.\n"
+    "You are a knowledgeable, conversational assistant. "
+    "Answer the user's question using ONLY the document passages provided below.\n\n"
     "Rules:\n"
-    "  1. Use ONLY the provided context passages.\n"
-    "  2. After each fact you use, add a citation [p.N] where N is the page number "
-    "     shown in the passage header — e.g. 'The model achieves 94 %% accuracy [p.3].'\n"
-    "  3. If the context does not contain enough information, say so explicitly.\n"
+    "  1. Ground every claim in the provided passages — do not use outside knowledge.\n"
+    "  2. After each fact, add [p.N] where N is the page number in the passage header.\n"
+    "     Example: 'Admins can manage workspaces via PowerShell [p.12].'\n"
+    "  3. If the passages do not contain enough information, say:\n"
+    "     'The document does not appear to cover this topic.'\n"
+    "  4. Be direct and conversational. Do not repeat the question. "
+    "Do not show your reasoning or thinking — respond with the final answer only.\n"
     "  {style}\n"
 )
 
@@ -184,10 +188,40 @@ async def stream_answer(
             stream=True,
             messages=[{"role": "system", "content": _make_system(style)}] + messages,
         )
+        # Buffer leading tokens to detect and strip reasoning-model CoT preamble.
+        # Reasoning models (e.g. nemotron) emit their thinking before the answer.
+        # We watch for a double-newline separator (which usually ends the CoT block).
+        buf = ""
+        buf_done = False
+        _COT_FLUSH = ("\n\n", "Answer:", "Here is", "Based on the")
+
         async for chunk in stream:
             delta = chunk.choices[0].delta.content
-            if delta:
+            if not delta:
+                continue
+
+            if buf_done:
                 yield delta
+                continue
+
+            buf += delta
+            # Flush buffer once we hit a natural separator or exceed threshold
+            flush_at = -1
+            for marker in _COT_FLUSH:
+                idx = buf.find(marker)
+                if idx != -1:
+                    flush_at = idx + len(marker)
+                    break
+
+            if flush_at != -1:
+                remainder = buf[flush_at:]
+                buf_done = True
+                if remainder.strip():
+                    yield remainder
+            elif len(buf) > 400:
+                # No CoT detected — just stream normally from here
+                buf_done = True
+                yield buf
     except Exception as e:
         logger.error("Stream error: %s", e)
         yield f"\n[Generation error: {e}]"
@@ -218,7 +252,9 @@ async def verify_grounding(
     Ask fast model: is this answer grounded in the context?
     Returns {"grounded": bool, "score": float, "issues": str}.
     """
-    if not SELF_RAG_ENABLED or not contexts or not answer:
+    if not contexts or not answer:
+        return {"grounded": False, "score": 0.0, "issues": "No supporting context found"}
+    if not SELF_RAG_ENABLED:
         return {"grounded": True, "score": 1.0, "issues": ""}
 
     ctx_snippet = "\n".join(f"[p.{c.page_num}] {c.parent_text[:300]}" for c in contexts)
