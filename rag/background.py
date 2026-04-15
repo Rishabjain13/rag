@@ -27,6 +27,17 @@ from typing import List
 import numpy as np
 from sklearn.cluster import KMeans
 
+# Limit concurrent LLM calls to the fast model (Groq free tier: ~30 req/min).
+# Created lazily inside the event loop to avoid "no running loop" on import.
+_LLM_SEM: asyncio.Semaphore | None = None
+
+
+def _get_sem() -> asyncio.Semaphore:
+    global _LLM_SEM
+    if _LLM_SEM is None:
+        _LLM_SEM = asyncio.Semaphore(5)
+    return _LLM_SEM
+
 from config import RAPTOR_CLUSTER_SIZE, RAPTOR_MAX_LEVELS
 from rag.models import ParentChunk, ChildChunk, RaptorNode, CachedQA
 from rag.embeddings import embed_texts
@@ -43,24 +54,23 @@ async def _generate_questions_for_heading(heading: str, llm_client) -> List[str]
     """Ask the fast model for 3 plausible questions about a heading."""
     from config import OPENROUTER_FAST_MODEL
     try:
-        response = await llm_client.chat.completions.create(
-            model=OPENROUTER_FAST_MODEL,
-            max_tokens=200,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Generate exactly 3 concise questions that a reader might ask about the "
-                        "following document section heading. Return one question per line, "
-                        "no numbering, no extra text."
-                    ),
-                },
-                {"role": "user", "content": heading},
-            ],
-        )
+        async with _get_sem():
+            response = await llm_client.chat.completions.create(
+                model=OPENROUTER_FAST_MODEL,
+                max_tokens=200,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Generate exactly 3 concise questions that a reader might ask about the "
+                            "following document section heading. Return one question per line, "
+                            "no numbering, no extra text."
+                        ),
+                    },
+                    {"role": "user", "content": heading},
+                ],
+            )
         text = response.choices[0].message.content or ""
-        # Reasoning models may include chain-of-thought before the actual questions.
-        # Keep only lines that look like questions: end with '?' and are concise.
         questions = [
             q.strip() for q in text.strip().splitlines()
             if q.strip().endswith("?") and len(q.strip()) < 200
@@ -101,18 +111,25 @@ async def build_qa_cache(
                 contexts = await retrieve_fn(question)
                 if not contexts:
                     continue
-                answer = await generate_answer(question, contexts)
+                async with _get_sem():
+                    answer = await generate_answer(question, contexts)
                 qa = CachedQA.create(question=question, answer=answer, doc_id=parents[0].doc_id)
                 await cache.store(qa.id, qa.question, qa.answer, qa.doc_id)
                 total += 1
             except Exception as e:
                 logger.warning("QA Cache: failed for '%s': %s", question, e)
-            await asyncio.sleep(0.1)   # gentle rate limiting
 
     logger.info("QA Cache: stored %d pre-computed answers", total)
 
 
 # ── RAPTOR Tree ───────────────────────────────────────────────────────────────
+
+async def _summarise_cluster(cluster_texts: List[str], doc_id: str, level: int) -> RaptorNode:
+    """Summarise one cluster under a concurrency semaphore."""
+    async with _get_sem():
+        summary = await generate_summary(cluster_texts)
+    return RaptorNode.create(doc_id=doc_id, text=summary, level=level, child_ids=[])
+
 
 async def _cluster_and_summarise(
     texts: List[str],
@@ -121,14 +138,13 @@ async def _cluster_and_summarise(
     level: int,
 ) -> List[RaptorNode]:
     """
-    Cluster *texts* via KMeans, summarise each cluster with Claude.
-    Returns a list of RaptorNodes at *level*.
+    Cluster *texts* via KMeans, summarise each cluster with the fast model.
+    All cluster summaries at a given level run in parallel (capped by _LLM_SEM).
     """
     n = len(texts)
     if n <= 1:
         summary = texts[0] if texts else ""
-        node = RaptorNode.create(doc_id=doc_id, text=summary, level=level, child_ids=[])
-        return [node]
+        return [RaptorNode.create(doc_id=doc_id, text=summary, level=level, child_ids=[])]
 
     n_clusters = max(1, min(n // RAPTOR_CLUSTER_SIZE, 20))
     emb_arr = np.array(embeddings, dtype=np.float32)
@@ -136,15 +152,12 @@ async def _cluster_and_summarise(
     km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     labels = km.fit_predict(emb_arr)
 
-    nodes: List[RaptorNode] = []
+    tasks = []
     for cluster_id in range(n_clusters):
         indices = [i for i, lbl in enumerate(labels) if lbl == cluster_id]
-        cluster_texts = [texts[i] for i in indices]
-        summary = await generate_summary(cluster_texts)
-        node = RaptorNode.create(doc_id=doc_id, text=summary, level=level, child_ids=[])
-        nodes.append(node)
+        tasks.append(_summarise_cluster([texts[i] for i in indices], doc_id, level))
 
-    return nodes
+    return list(await asyncio.gather(*tasks))
 
 
 async def build_raptor_tree(

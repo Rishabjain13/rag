@@ -362,7 +362,7 @@ async def delete_doc(doc_id: str, request: Request):
     state = _state(request)
     if not state.stores.registry.get(doc_id):
         raise HTTPException(status_code=404, detail=f"doc_id={doc_id} not found.")
-    state.stores.remove_doc(doc_id)
+    await state.stores.remove_doc(doc_id)
     pdf = Path(UPLOAD_DIR) / f"{doc_id}.pdf"
     if pdf.exists():
         pdf.unlink()

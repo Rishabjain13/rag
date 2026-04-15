@@ -23,8 +23,6 @@ FAST_MODEL_BASE_URL: str = os.getenv("FAST_MODEL_BASE_URL", "") or OPENROUTER_BA
 OPENROUTER_FAST_MODEL: str = os.getenv("OPENROUTER_FAST_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 
 # ── Embeddings ────────────────────────────────────────────
-JINA_API_KEY: str    = os.getenv("JINA_API_KEY", "")
-JINA_MODEL: str      = os.getenv("JINA_MODEL", "jina-embeddings-v3")
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIM: int   = int(os.getenv("EMBEDDING_DIM", "384"))
 
@@ -36,8 +34,8 @@ QDRANT_RAPTOR_COLLECTION: str  = os.getenv("QDRANT_RAPTOR_COLLECTION", "rag_rapt
 
 # ── Chunking ──────────────────────────────────────────────
 PARENT_CHUNK_TOKENS: int  = int(os.getenv("PARENT_CHUNK_TOKENS", "800"))
-CHILD_CHUNK_TOKENS: int   = int(os.getenv("CHILD_CHUNK_TOKENS", "200"))
-CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "32"))
+CHILD_CHUNK_TOKENS: int   = int(os.getenv("CHILD_CHUNK_TOKENS", "300"))
+CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "40"))
 
 # ── Retrieval ─────────────────────────────────────────────
 TOP_K_SEARCH: int  = int(os.getenv("TOP_K_SEARCH", "25"))
@@ -81,18 +79,6 @@ API_KEY: str           = os.getenv("API_KEY", "")           # empty = no auth
 MAX_FILE_SIZE_MB: int  = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 RATE_LIMIT_QUERY: str  = os.getenv("RATE_LIMIT_QUERY", "30/minute")
 RATE_LIMIT_INGEST: str = os.getenv("RATE_LIMIT_INGEST", "5/minute")
-
-# ── Jina rate limiting ────────────────────────────────────
-# JINA_RPM: requests per minute your Jina tier allows.
-#   Free tier  → 10 RPM   |   Paid tier → 60+ RPM
-# The token-bucket limiter proactively paces requests so 429s never occur.
-JINA_RPM: int         = int(os.getenv("JINA_RPM", "10"))
-JINA_CONCURRENCY: int = int(os.getenv("JINA_CONCURRENCY", "2"))
-# JINA_FOR_INGEST: use Jina for embed_children() during ingestion.
-#   true  → Jina native late-chunking (higher quality, but RPM-limited)
-#   false → local model for ingestion only (no rate limits, fast for large PDFs)
-#           Jina still used for embed_query() and embed_texts() when key is set.
-JINA_FOR_INGEST: bool = os.getenv("JINA_FOR_INGEST", "false").lower() == "true"
 
 # ── Persistence (for use with Docker Qdrant) ───────────────
 # BM25, ParentStore, DocRegistry are in-memory. When QDRANT_URL

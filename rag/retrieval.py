@@ -421,9 +421,11 @@ async def retrieve(
         variants = [q for q in await expand_query(query) if q.lower() != query.lower()]
         if variants:
             trace.queries = [query] + variants
+            # Embed all variant queries in parallel, then launch hybrid searches in parallel
+            variant_vecs = await asyncio.gather(*[embed_query(q) for q in variants])
             extra_tasks = [
-                hybrid_search(q, await embed_query(q), stores, TOP_K_SEARCH, doc_id)
-                for q in variants
+                hybrid_search(q, vec, stores, TOP_K_SEARCH, doc_id)
+                for q, vec in zip(variants, variant_vecs)
             ]
             for hits, nd2, nc2, nb2 in await asyncio.gather(*extra_tasks):
                 all_ranked.append(hits)

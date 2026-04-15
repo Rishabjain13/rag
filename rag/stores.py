@@ -102,29 +102,32 @@ class QdrantStore:
         k: int = TOP_K_SEARCH,
         doc_id: Optional[str] = None,
     ) -> List[SearchHit]:
-        query_filter = None
-        if doc_id:
-            from qdrant_client.models import Filter, FieldCondition, MatchValue
-            query_filter = Filter(
-                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+        try:
+            kwargs: dict = dict(
+                collection_name=QDRANT_COLLECTION,
+                query=query_vec,
+                limit=k,
+                with_payload=True,
             )
-        results = await self.client.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=query_vec,
-            limit=k,
-            with_payload=True,
-            query_filter=query_filter,
-        )
-        return [
-            SearchHit(
-                child_id=r.id,
-                parent_id=r.payload["parent_id"],
-                text=r.payload["text"],
-                score=r.score,
-                source="dense",
-            )
-            for r in results.points
-        ]
+            if doc_id:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                kwargs["query_filter"] = Filter(
+                    must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+                )
+            results = await self.client.query_points(**kwargs)
+            return [
+                SearchHit(
+                    child_id=str(r.id),
+                    parent_id=r.payload["parent_id"],
+                    text=r.payload["text"],
+                    score=r.score,
+                    source="dense",
+                )
+                for r in results.points
+            ]
+        except Exception as e:
+            logger.warning("Qdrant search failed (collection missing?): %s", e)
+            return []
 
     # ── Cache ──────────────────────────────────────────────────────────────────
 
@@ -147,20 +150,19 @@ class QdrantStore:
         doc_id: Optional[str] = None,
     ) -> Optional[str]:
         try:
-            query_filter = None
-            if doc_id:
-                from qdrant_client.models import Filter, FieldCondition, MatchValue
-                query_filter = Filter(
-                    must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
-                )
-            results = await self.client.query_points(
+            kwargs: dict = dict(
                 collection_name=QDRANT_CACHE_COLLECTION,
                 query=query_vec,
                 limit=1,
                 with_payload=True,
                 score_threshold=threshold,
-                query_filter=query_filter,
             )
+            if doc_id:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                kwargs["query_filter"] = Filter(
+                    must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+                )
+            results = await self.client.query_points(**kwargs)
             if results.points:
                 return results.points[0].payload["answer"]
         except Exception:
@@ -190,19 +192,18 @@ class QdrantStore:
         doc_id: Optional[str] = None,
     ) -> List[str]:
         try:
-            query_filter = None
-            if doc_id:
-                from qdrant_client.models import Filter, FieldCondition, MatchValue
-                query_filter = Filter(
-                    must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
-                )
-            results = await self.client.query_points(
+            kwargs: dict = dict(
                 collection_name=QDRANT_RAPTOR_COLLECTION,
                 query=query_vec,
                 limit=k,
                 with_payload=True,
-                query_filter=query_filter,
             )
+            if doc_id:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                kwargs["query_filter"] = Filter(
+                    must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+                )
+            results = await self.client.query_points(**kwargs)
             return [r.payload["text"] for r in results.points]
         except Exception:
             return []
@@ -477,9 +478,12 @@ class RAGStores:
         self.parents.add(parents)
         self._all_children.extend(children)
 
-        # Qdrant + BM25 are fast — ready for queries immediately
-        await self.qdrant.add_children(children, dim)
-        self.bm25.rebuild(self._all_children)
+        # Qdrant upsert (async) + BM25 rebuild (executor) run concurrently
+        loop = asyncio.get_event_loop()
+        await asyncio.gather(
+            self.qdrant.add_children(children, dim),
+            loop.run_in_executor(None, self.bm25.rebuild, self._all_children),
+        )
 
         self._ready = True
         logger.info("Core indexes ready (doc: %s) — ColBERT building in background", doc_id)
@@ -494,12 +498,13 @@ class RAGStores:
 
     async def _build_colbert_bg(self, doc_id: str):
         """Build ColBERT index without blocking ingestion or queries."""
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.colbert.build_index, self._all_children)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.colbert.build_index, self._all_children)
+        # build_index() catches its own errors and sets _fallback=True on failure
+        if self.colbert._fallback:
+            logger.info("ColBERT unavailable — cross-encoder reranker active (doc: %s)", doc_id)
+        else:
             logger.info("ColBERT index ready (doc: %s)", doc_id)
-        except Exception as e:
-            logger.warning("ColBERT background build failed: %s — cross-encoder stays active", e)
 
     def is_ready(self) -> bool:
         return self._ready
@@ -512,14 +517,21 @@ class RAGStores:
         self.registry = DocRegistry()
         self._all_children.clear()
         self._ready = False
+        # Delete persisted files so a restart doesn't restore stale in-memory
+        # state that points to now-deleted Qdrant collections.
+        for name in ("bm25.pkl", "parents.pkl", "registry.pkl", "children.pkl"):
+            p = self._persist_path(name)
+            if p.exists():
+                p.unlink()
 
-    def remove_doc(self, doc_id: str):
+    async def remove_doc(self, doc_id: str):
         """Remove one document from all stores."""
         self._all_children = [c for c in self._all_children if c.doc_id != doc_id]
         self.parents.remove_doc(doc_id)
         self.registry.remove(doc_id)
         if self._all_children:
-            self.bm25.rebuild(self._all_children)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.bm25.rebuild, self._all_children)
         else:
             self.bm25 = BM25Store()
         self._ready = bool(self._all_children)
@@ -553,6 +565,41 @@ class RAGStores:
             logger.info("Local state persisted to %s", PERSIST_DIR)
         except Exception as e:
             logger.warning("Failed to persist local state: %s", e)
+
+    async def restore_qdrant_if_needed(self) -> bool:
+        """
+        Re-populate Qdrant from persisted children when the collection is
+        missing or empty (e.g. Docker volume wiped, or DELETE /collection ran
+        before the persist-file fix).
+
+        Returns True if a re-population was performed.
+        """
+        if not self._all_children:
+            return False
+        dim = next((len(c.embedding) for c in self._all_children if c.embedding), None)
+        if not dim:
+            logger.warning("Persisted children have no embeddings — cannot restore Qdrant")
+            return False
+
+        try:
+            from qdrant_client.models import Filter  # noqa — import check only
+            collections = {
+                c.name for c in (await self.qdrant.client.get_collections()).collections
+            }
+            if QDRANT_COLLECTION in collections:
+                count_result = await self.qdrant.client.count(QDRANT_COLLECTION)
+                if count_result.count == len(self._all_children):
+                    return False  # already in sync
+            logger.info(
+                "Qdrant out of sync — re-populating from %d persisted children",
+                len(self._all_children),
+            )
+            await self.qdrant.add_children(self._all_children, dim)
+            logger.info("Qdrant re-populated successfully")
+            return True
+        except Exception as e:
+            logger.error("Qdrant restore failed: %s", e)
+            return False
 
     def load_local(self) -> bool:
         """

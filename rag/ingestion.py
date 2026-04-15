@@ -1,15 +1,18 @@
 """
-Ingestion pipeline: PDF → pages → parent/child chunks → all indexes.
+Ingestion pipeline: document → pages → parent/child chunks → indexes.
 
-Improvements over v1
-────────────────────
-  pdfplumber parser   handles complex layouts, columns, headers far better
-                      than pypdf; extracts tables as markdown grids
-  Table extraction    tables become | col | col | rows preserved as text
-  Section-boundary    split at detected headings first, then overflow by tokens
-  chunking            preserves semantic units; less wasted overlap
-  Doc fingerprint     MD5 hash of file bytes → instant duplicate detection
-  Progress generator  ingest_pdf_streaming() yields progress events for SSE
+Parallelism notes
+─────────────────
+  parse_pdf()      CPU-bound (pdfplumber) → run_in_executor so the event loop
+                   is never blocked during parsing.
+
+  build_chunks()   CPU-bound (tiktoken) → run_in_executor.
+
+  _embed_children() One batch encode() call for ALL children together
+                   via run_in_executor. batch_size=64 handled internally.
+
+  add_documents()  Qdrant upsert (async) + BM25 rebuild (executor) run after
+                   embedding. ColBERT builds as a background asyncio task.
 """
 from __future__ import annotations
 
@@ -17,9 +20,8 @@ import asyncio
 import hashlib
 import logging
 import re
-from collections import defaultdict
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Tuple
+from typing import AsyncIterator, List, Tuple
 
 import tiktoken
 
@@ -28,9 +30,8 @@ from config import (
     CHILD_CHUNK_TOKENS,
     CHUNK_OVERLAP_TOKENS,
 )
-from config import JINA_API_KEY, JINA_FOR_INGEST, JINA_CONCURRENCY
 from rag.models import PageContent, ParentChunk, ChildChunk
-from rag.embeddings import embed_children, _embed_local
+from rag.embeddings import _embed_local
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +70,11 @@ def _split_by_tokens(text: str, max_tokens: int, overlap: int) -> List[str]:
 
 _HEADING_RE = re.compile(
     r"^(?:"
-    r"[A-Z][A-Z\s]{2,}(?:[:\.])?(?=\s|$)"          # ALL CAPS
-    r"|\d+(?:\.\d+)*\s+[A-Z][^\n]{0,80}"             # 1.2 Title
+    r"[A-Z][A-Z\s]{2,}(?:[:\.])?(?=\s|$)"
+    r"|\d+(?:\.\d+)*\s+[A-Z][^\n]{0,80}"
     r"|(?:Abstract|Introduction|Conclusion|References"
     r"|Background|Methodology|Method|Result|Discussion"
-    r"|Related Work|Future Work)[^\n]{0,60}"          # common section names
+    r"|Related Work|Future Work)[^\n]{0,60}"
     r")$",
     re.MULTILINE,
 )
@@ -84,11 +85,9 @@ def _extract_headings(text: str) -> List[str]:
 
 
 def _table_to_markdown(table: List[List]) -> str:
-    """Convert a pdfplumber table (list of rows) to a markdown table string."""
     if not table:
         return ""
     rows = [[str(cell or "").strip() for cell in row] for row in table]
-    # Remove completely empty rows
     rows = [r for r in rows if any(c for c in r)]
     if not rows:
         return ""
@@ -99,7 +98,6 @@ def _table_to_markdown(table: List[List]) -> str:
         "| " + " | ".join(sep) + " |",
     ]
     for row in rows[1:]:
-        # Pad/truncate row to header width
         while len(row) < len(header):
             row.append("")
         lines.append("| " + " | ".join(row[:len(header)]) + " |")
@@ -112,6 +110,7 @@ def parse_pdf(pdf_path: str | Path) -> List[PageContent]:
     """
     Extract text + tables from every page using pdfplumber.
     Falls back to pypdf if pdfplumber fails on a page.
+    Runs synchronously — call via run_in_executor to avoid blocking.
     """
     pages: List[PageContent] = []
 
@@ -119,11 +118,7 @@ def parse_pdf(pdf_path: str | Path) -> List[PageContent]:
         import pdfplumber
         with pdfplumber.open(str(pdf_path)) as pdf:
             for i, page in enumerate(pdf.pages):
-                # Extract text
-                text = page.extract_text() or ""
-                text = text.strip()
-
-                # Extract tables as markdown
+                text = (page.extract_text() or "").strip()
                 table_strings: List[str] = []
                 try:
                     for table in page.extract_tables():
@@ -136,15 +131,13 @@ def parse_pdf(pdf_path: str | Path) -> List[PageContent]:
                 if not text and not table_strings:
                     continue
 
-                # Merge tables into text (append after page text)
                 if table_strings:
                     text = text + "\n\n" + "\n\n".join(table_strings)
 
-                headings = _extract_headings(text)
                 pages.append(PageContent(
                     page_num=i + 1,
                     text=text,
-                    headings=headings,
+                    headings=_extract_headings(text),
                     tables=table_strings,
                 ))
 
@@ -162,18 +155,13 @@ def parse_pdf(pdf_path: str | Path) -> List[PageContent]:
                 headings=_extract_headings(text),
             ))
 
-    logger.info("Parsed %d non-empty pages from %s", len(pages), pdf_path)
+    logger.info("Parsed %d non-empty pages", len(pages))
     return pages
 
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
 
 def _detect_section_boundaries(text: str) -> List[Tuple[int, str]]:
-    """
-    Return list of (char_offset, heading_text) for each section boundary found.
-    Used to split at semantically meaningful points before falling back to
-    pure token-count splits.
-    """
     boundaries: List[Tuple[int, str]] = []
     for m in _HEADING_RE.finditer(text):
         boundaries.append((m.start(), m.group().strip()))
@@ -181,21 +169,13 @@ def _detect_section_boundaries(text: str) -> List[Tuple[int, str]]:
 
 
 def _make_parents(pages: List[PageContent], doc_id: str) -> List[ParentChunk]:
-    """
-    Section-boundary aware parent chunking:
-      1. Split page text at detected headings
-      2. If a section is larger than PARENT_CHUNK_TOKENS, further split by tokens
-      3. If a section is tiny, merge with the next section
-    """
     parents: List[ParentChunk] = []
-
     for page in pages:
         full_text = page.text
         boundaries = _detect_section_boundaries(full_text)
 
         if len(boundaries) > 1:
-            # Split at heading boundaries
-            sections: List[Tuple[str, str]] = []   # (section_text, heading)
+            sections: List[Tuple[str, str]] = []
             for idx, (start, heading) in enumerate(boundaries):
                 end = boundaries[idx + 1][0] if idx + 1 < len(boundaries) else len(full_text)
                 section_text = full_text[start:end].strip()
@@ -205,7 +185,6 @@ def _make_parents(pages: List[PageContent], doc_id: str) -> List[ParentChunk]:
             heading = page.headings[0] if page.headings else ""
             sections = [(full_text, heading)]
 
-        # For each section, token-split if too large; merge if too small
         buffer_text = ""
         buffer_heading = ""
         MIN_TOKENS = PARENT_CHUNK_TOKENS // 4
@@ -214,31 +193,23 @@ def _make_parents(pages: List[PageContent], doc_id: str) -> List[ParentChunk]:
             tok_count = _count_tokens(section_text)
 
             if tok_count > PARENT_CHUNK_TOKENS:
-                # Flush buffer first
                 if buffer_text:
                     _add_parent(parents, buffer_text, buffer_heading, doc_id, page.page_num)
                     buffer_text = buffer_heading = ""
-                # Split large section
                 for sub in _split_by_tokens(section_text, PARENT_CHUNK_TOKENS, CHUNK_OVERLAP_TOKENS):
                     _add_parent(parents, sub, heading, doc_id, page.page_num)
-
             elif tok_count < MIN_TOKENS:
-                # Too small – accumulate into buffer
                 buffer_text = (buffer_text + " " + section_text).strip()
                 buffer_heading = buffer_heading or heading
-
-                # If buffer is now large enough, flush
                 if _count_tokens(buffer_text) >= MIN_TOKENS:
                     _add_parent(parents, buffer_text, buffer_heading, doc_id, page.page_num)
                     buffer_text = buffer_heading = ""
             else:
-                # Flush buffer then add this section
                 if buffer_text:
                     _add_parent(parents, buffer_text, buffer_heading, doc_id, page.page_num)
                     buffer_text = buffer_heading = ""
                 _add_parent(parents, section_text, heading, doc_id, page.page_num)
 
-        # Flush any remaining buffer
         if buffer_text:
             _add_parent(parents, buffer_text, buffer_heading, doc_id, page.page_num)
 
@@ -247,10 +218,9 @@ def _make_parents(pages: List[PageContent], doc_id: str) -> List[ParentChunk]:
 
 
 def _add_parent(parents: List[ParentChunk], text: str, heading: str, doc_id: str, page_num: int):
-    tok = _count_tokens(text)
     parents.append(ParentChunk.create(
         doc_id=doc_id, text=text, page_num=page_num,
-        heading=heading, section=heading, token_count=tok,
+        heading=heading, section=heading, token_count=_count_tokens(text),
     ))
 
 
@@ -266,6 +236,10 @@ def _make_children(parent: ParentChunk) -> List[ChildChunk]:
 
 
 def build_chunks(pages: List[PageContent], doc_id: str) -> Tuple[List[ParentChunk], List[ChildChunk]]:
+    """
+    Build parent + child chunks from parsed pages.
+    Synchronous — call via run_in_executor to avoid blocking.
+    """
     parents = _make_parents(pages, doc_id)
     children: List[ChildChunk] = []
     for p in parents:
@@ -274,65 +248,26 @@ def build_chunks(pages: List[PageContent], doc_id: str) -> Tuple[List[ParentChun
     return parents, children
 
 
-# ── Embedding helpers ─────────────────────────────────────────────────────────
+# ── Embedding ─────────────────────────────────────────────────────────────────
 
-async def _embed_all_children(
-    parents: List[ParentChunk],
-    children: List[ChildChunk],
-) -> List[ChildChunk]:
+async def _embed_children(children: List[ChildChunk]) -> List[ChildChunk]:
     """
-    Embed all children.
-
-    Local path (JINA_FOR_INGEST=false or no JINA_API_KEY):
-      ONE batch encode call for all children → thread-safe, no concurrency
-      issues, sentence-transformers handles internal batching (batch_size=32).
-      For 1621 children: ~51 batches × ~100 ms = ~5 s on CPU.
-
-    Jina path (JINA_API_KEY set and JINA_FOR_INGEST=true):
-      asyncio.gather → per-parent concurrent API calls, rate-limited by
-      token-bucket (JINA_RPM) and semaphore (JINA_CONCURRENCY).
+    Batch-embed all children in a single executor call.
+    sentence-transformers splits internally at batch_size=64.
     """
-    # ── Fast local path: single batch encode, fully thread-safe ──────────────
-    use_jina = bool(JINA_API_KEY) and JINA_FOR_INGEST
-    if not use_jina:
-        logger.info("Local batch embed: %d children in one pass…", len(children))
-        loop = asyncio.get_event_loop()
-        texts    = [c.text for c in children]
-        all_embs = await loop.run_in_executor(None, _embed_local, texts)
-        for child, emb in zip(children, all_embs):
-            child.embedding = emb
-        logger.info("Local embed done: %d embeddings", len(all_embs))
+    if not children:
         return children
-
-    # ── Jina path: per-parent concurrent late-chunking ────────────────────────
-    parent_map: Dict[str, ParentChunk] = {p.id: p for p in parents}
-    by_parent: Dict[str, List[ChildChunk]] = defaultdict(list)
-    for c in children:
-        by_parent[c.parent_id].append(c)
-
-    parent_ids   = list(by_parent.keys())
-    kids_per_pid = [by_parent[pid] for pid in parent_ids]
-
-    async def _embed_one(pid: str, kids: List[ChildChunk]) -> List[ChildChunk]:
-        texts = [k.text for k in kids]
-        embs  = await embed_children(parent_map[pid].text, texts)
-        for kid, emb in zip(kids, embs):
-            kid.embedding = emb
-        return kids
-
-    logger.info("Jina: embedding %d parent batches concurrently (JINA_CONCURRENCY=%d)…",
-                len(parent_ids), JINA_CONCURRENCY)
-
-    results = await asyncio.gather(
-        *[_embed_one(pid, kids) for pid, kids in zip(parent_ids, kids_per_pid)]
-    )
-
-    embedded: List[ChildChunk] = [kid for batch in results for kid in batch]
-    logger.info("Jina: embedded %d children", len(embedded))
-    return embedded
+    logger.info("Embedding %d children (batch, local)…", len(children))
+    loop = asyncio.get_event_loop()
+    texts = [c.text for c in children]
+    embeddings = await loop.run_in_executor(None, _embed_local, texts)
+    for child, emb in zip(children, embeddings):
+        child.embedding = emb
+    logger.info("Embedding complete: %d vectors", len(embeddings))
+    return children
 
 
-# ── Standard ingestion (returns when done) ────────────────────────────────────
+# ── Standard ingestion ────────────────────────────────────────────────────────
 
 async def ingest_pdf(
     pdf_path: str | Path,
@@ -341,15 +276,19 @@ async def ingest_pdf(
 ) -> Tuple[List[ParentChunk], List[ChildChunk], int]:
     """
     End-to-end ingestion. Returns (parents, children, n_pages).
+    parse + chunk run in thread-pool so the event loop stays free.
     """
-    pages = parse_pdf(pdf_path)
-    parents, children = build_chunks(pages, doc_id)
-    embedded = await _embed_all_children(parents, children)
-    await stores.add_documents(parents, embedded, doc_id)
-    return parents, embedded, len(pages)
+    loop = asyncio.get_event_loop()
+
+    pages = await loop.run_in_executor(None, parse_pdf, pdf_path)
+    parents, children = await loop.run_in_executor(None, build_chunks, pages, doc_id)
+    children = await _embed_children(children)
+    await stores.add_documents(parents, children, doc_id)
+
+    return parents, children, len(pages)
 
 
-# ── Streaming ingestion (yields progress events for SSE) ─────────────────────
+# ── Streaming ingestion ───────────────────────────────────────────────────────
 
 async def ingest_pdf_streaming(
     pdf_path: str | Path,
@@ -357,71 +296,38 @@ async def ingest_pdf_streaming(
     stores,
 ) -> AsyncIterator[dict]:
     """
-    Same as ingest_pdf but yields progress dicts so the API can stream them.
-    Usage: async for event in ingest_pdf_streaming(...): ...
+    Same as ingest_pdf but yields SSE progress events.
     """
+    loop = asyncio.get_event_loop()
+
     yield {"stage": "parsing", "progress": 0.05, "message": "Parsing PDF pages…"}
-    pages = parse_pdf(pdf_path)
+    pages = await loop.run_in_executor(None, parse_pdf, pdf_path)
     n_tables = sum(len(p.tables) for p in pages)
     yield {
-        "stage": "parsing", "progress": 0.2,
-        "message": f"Parsed {len(pages)} pages, {n_tables} tables extracted",
+        "stage": "parsing", "progress": 0.20,
+        "message": f"Parsed {len(pages)} pages, {n_tables} tables",
     }
 
     yield {"stage": "chunking", "progress": 0.25, "message": "Building parent/child chunks…"}
-    parents, children = build_chunks(pages, doc_id)
+    parents, children = await loop.run_in_executor(None, build_chunks, pages, doc_id)
     yield {
         "stage": "chunking", "progress": 0.40,
-        "message": f"{len(parents)} parents, {len(children)} children created",
+        "message": f"{len(parents)} parents, {len(children)} children",
     }
 
-    yield {"stage": "embedding", "progress": 0.42, "message": "Embedding children…"}
+    yield {"stage": "embedding", "progress": 0.42,
+           "message": f"Embedding {len(children)} chunks…"}
+    children = await _embed_children(children)
+    yield {"stage": "embedding", "progress": 0.80,
+           "message": f"Embedded {len(children)} chunks"}
 
-    use_jina = bool(JINA_API_KEY) and JINA_FOR_INGEST
-
-    if not use_jina:
-        # ── Local batch path: one encode call, no threading issues ────────────
-        loop = asyncio.get_event_loop()
-        texts    = [c.text for c in children]
-        all_embs = await loop.run_in_executor(None, _embed_local, texts)
-        for child, emb in zip(children, all_embs):
-            child.embedding = emb
-        embedded = list(children)
-        yield {"stage": "embedding", "progress": 0.80,
-               "message": f"Embedded {len(embedded)} children (local batch)"}
-    else:
-        # ── Jina path: per-parent with progress reporting ─────────────────────
-        parent_map: Dict[str, ParentChunk] = {p.id: p for p in parents}
-        by_parent: Dict[str, List[ChildChunk]] = defaultdict(list)
-        for c in children:
-            by_parent[c.parent_id].append(c)
-
-        embedded: List[ChildChunk] = []
-        total = len(by_parent)
-        for i, (pid, kids) in enumerate(by_parent.items(), start=1):
-            child_texts = [k.text for k in kids]
-            embs = await embed_children(parent_map[pid].text, child_texts)
-            for kid, emb in zip(kids, embs):
-                kid.embedding = emb
-                embedded.append(kid)
-            if i % max(1, total // 10) == 0:
-                progress = 0.42 + 0.38 * (i / total)
-                yield {"stage": "embedding", "progress": round(progress, 2),
-                       "message": f"Embedded {i}/{total} parent batches"}
-
-    yield {"stage": "indexing", "progress": 0.82, "message": "Building Qdrant + BM25 + ColBERT indexes…"}
-    await stores.add_documents(parents, embedded, doc_id)
+    yield {"stage": "indexing", "progress": 0.82,
+           "message": "Building Qdrant + BM25 indexes…"}
+    await stores.add_documents(parents, children, doc_id)
     yield {"stage": "indexing", "progress": 1.0, "message": "All indexes ready"}
 
-    # Attach result to last event
     yield {
-        "stage": "done",
-        "progress": 1.0,
-        "pages": len(pages),
-        "parents": len(parents),
-        "children": len(embedded),
-        "doc_id": doc_id,
+        "stage": "done", "progress": 1.0,
+        "pages": len(pages), "parents": len(parents),
+        "children": len(children), "doc_id": doc_id,
     }
-    # Make parents + children accessible to caller via generator send() – not possible
-    # easily, so store them on the generator object via a mutable dict trick
-    # Caller should call ingest_pdf() for the return value if needed.

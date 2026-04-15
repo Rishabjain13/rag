@@ -18,9 +18,20 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
+
+# Set PyTorch CPU thread count before any imports that touch torch.
+# Must happen in the main process — setting inside an executor thread is unreliable.
+try:
+    import torch
+    _n = os.cpu_count() or 4
+    torch.set_num_threads(_n)
+    torch.set_num_interop_threads(max(1, _n // 2))
+except Exception:
+    pass
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -33,9 +44,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from api.routes import router
 from config import RATE_LIMIT_QUERY, RATE_LIMIT_INGEST, QDRANT_URL, PERSIST_DIR
-from rag.stores import RAGStores
+from rag.stores import RAGStores, _get_cross_encoder
 from rag.cache import SemanticCache
 from rag.sessions import SessionStore
+from rag.embeddings import _local_model
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -83,15 +95,24 @@ app.include_router(router)
 # ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
+    # ── Preload CPU models in background so first query has no cold-start ──────
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _local_model)          # BGE embedding model
+    loop.run_in_executor(None, _get_cross_encoder)    # cross-encoder reranker
+
     stores = RAGStores()
 
     # ── Restore persisted state when using Docker / persistent Qdrant ─────────
-    # Qdrant already has the vectors.  load_local() restores BM25, ParentStore,
-    # DocRegistry, and _all_children from disk so queries work immediately
-    # without re-ingesting any documents.
+    # load_local() restores BM25, ParentStore, DocRegistry, and _all_children.
+    # restore_qdrant_if_needed() then verifies Qdrant has the vectors and
+    # re-populates from persisted children if the collection is missing/empty
+    # (e.g. Docker volume wiped, or DELETE /collection called previously).
     restored = False
+    qdrant_repopulated = False
     if QDRANT_URL:
         restored = stores.load_local()
+        if restored:
+            qdrant_repopulated = await stores.restore_qdrant_if_needed()
 
     app.state.stores       = stores
     app.state.cache        = SemanticCache(stores.qdrant)
@@ -109,6 +130,8 @@ async def startup():
             n_children = len(stores._all_children)
             logger.info("  Restored: %d docs, %d parents, %d children",
                         len(docs), n_parents, n_children)
+            if qdrant_repopulated:
+                logger.info("  Qdrant vectors re-populated from persisted state")
         else:
             logger.info("  No prior state found – ingest a PDF to begin")
     else:
